@@ -1,0 +1,10 @@
+# Python
+venv/
+__pycache__/
+
+# Project Files
+uploads/
+legal_insight.db
+
+# Secrets - DO NOT UPLOAD
+.env
