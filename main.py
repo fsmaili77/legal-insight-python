@@ -72,7 +72,7 @@ def init_db():
         IF NOT EXISTS(SELECT * FROM sysobjects WHERE name='cases' AND xtype='U')
         CREATE TABLE cases(
             id INT IDENTITY(1,1) PRIMARY KEY,
-            filename NVARCHAR(255) UNIQUE NOT NULL,
+            filename NVARCHAR(255) NOT NULL,
             title NVARCHAR(255),
             summary NVARCHAR(MAX),
             parties NVARCHAR(MAX),
@@ -96,7 +96,9 @@ def init_db():
             tags NVARCHAR(MAX),
             updated_at DATETIME DEFAULT GETDATE(),
             analyzed_at DATETIME,
-            original_name NVARCHAR(255)
+            original_name NVARCHAR(255),
+            user_id NVARCHAR(450),
+            client_id INT
         );
     """)
 
@@ -108,7 +110,9 @@ def init_db():
         ("tags", "NVARCHAR(MAX)"),
         ("updated_at", "DATETIME DEFAULT GETDATE()"),
         ("analyzed_at", "DATETIME"),
-        ("original_name", "NVARCHAR(255)")
+        ("original_name", "NVARCHAR(255)"),
+        ("user_id", "NVARCHAR(450)"),  # ASP.NET Identity UserId
+        ("client_id", "INT")
     ]
 
     for col, defn in new_columns:
@@ -118,9 +122,67 @@ def init_db():
         except Exception as e:
             logger.debug(f"Column {col} already exists: {e}")
 
+    # Add indexes for performance
+    try:
+        cursor.execute("""
+            IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = 'IX_cases_user_id')
+            CREATE INDEX IX_cases_user_id ON cases(user_id)
+        """)
+        logger.info("Created index on user_id")
+    except Exception as e:
+        logger.debug(f"Index IX_cases_user_id already exists: {e}")
+
+    try:
+        cursor.execute("""
+            IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = 'IX_cases_client_id')
+            CREATE INDEX IX_cases_client_id ON cases(client_id)
+        """)
+        logger.info("Created index on client_id")
+    except Exception as e:
+        logger.debug(f"Index IX_cases_client_id already exists: {e}")
+
+    # Create Clients table if not exists
+    cursor.execute("""
+        IF NOT EXISTS(SELECT * FROM sysobjects WHERE name='Clients' AND xtype='U')
+        CREATE TABLE Clients(
+            Id INT IDENTITY(1,1) PRIMARY KEY,
+            Name NVARCHAR(255) NOT NULL,
+            Email NVARCHAR(255),
+            Phone NVARCHAR(50),
+            Address NVARCHAR(500),
+            UserId NVARCHAR(450) NOT NULL,
+            CreatedAt DATETIME DEFAULT GETDATE(),
+            UpdatedAt DATETIME DEFAULT GETDATE()
+        );
+    """)
+
+    # Add index on Clients.UserId
+    try:
+        cursor.execute("""
+            IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = 'IX_Clients_UserId')
+            CREATE INDEX IX_Clients_UserId ON Clients(UserId)
+        """)
+        logger.info("Created index on Clients.UserId")
+    except Exception as e:
+        logger.debug(f"Index IX_Clients_UserId already exists: {e}")
+
     conn.commit()
     conn.close()
     logger.info("SQL Server database initialized.")
+
+# --- Helper: Verify client ownership ---
+def verify_client_ownership(client_id, user_id):
+    """Verify that a client belongs to the specified user"""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT Id FROM Clients WHERE Id = ? AND UserId = ?", (client_id, user_id))
+        result = cursor.fetchone()
+        conn.close()
+        return result is not None
+    except Exception as e:
+        logger.error(f"Error verifying client ownership: {e}")
+        return False
 
 # --- Practice Area, Confidence, Priority logic ---
 def detect_practice_area(text, document_type=None, parties=None):
@@ -302,7 +364,6 @@ def perform_gemini_analysis(text):
         logger.error("GEMINI_API_KEY not found.")
         return None
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
-    #url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent?key={api_key}"
     json_schema = {
         "type": "OBJECT",
         "properties": {
@@ -336,14 +397,12 @@ Return ONLY in the specified JSON format."""
     try:
         response = requests.post(url, json=payload)
         
-        # UPDATED: Improved error handling to see the exact error from Google
         if response.status_code != 200:
             logger.error(f"Gemini API error {response.status_code}: {response.text}")
         
         response.raise_for_status()
         outer_json = response.json()
         
-        # Verify that the response contains the expected structure
         if 'candidates' in outer_json and len(outer_json['candidates']) > 0:
             json_string = outer_json['candidates'][0]['content']['parts'][0]['text']
             return json.loads(json_string)
@@ -363,33 +422,53 @@ Return ONLY in the specified JSON format."""
 
 # --- Routes ---
 @app.route('/analyze', methods=['POST'])
-@require_auth  # Require authentication
+@require_auth
 def analyze_document_route():
-    # Get user from token
+    """
+    Upload and analyze a document with proper client isolation and duplicate handling.
+    Returns status='duplicate' when the same file is uploaded for the same client.
+    """
     user = get_user_from_token()
     if not user:
         return jsonify({"error": "Authentication required"}), 401
-    
+        
     user_id = user.get('user_id')
     user_email = user.get('email')
-    # Get client_id from form data
+    
+    # 🔥 DEBUG: Log exactly what Flask receives
+    logger.info(f"=== Request Debug ===")
+    logger.info(f"Content-Type header: {request.headers.get('Content-Type')}")
+    logger.info(f"Form keys: {list(request.form.keys())}")
+    logger.info(f"Files keys: {list(request.files.keys())}")
+    for key in request.form:
+        logger.info(f"Form[{key}]: {request.form[key][:100] if len(request.form[key]) > 100 else request.form[key]}")
+    for key in request.files:
+        f = request.files[key]
+        logger.info(f"File[{key}]: {f.filename}, size: {len(f.read())}, mimetype: {f.content_type}")
+        f.seek(0)  # Reset file pointer
+    logger.info(f"=== End Debug ===")
+    
     client_id = request.form.get('clientId')
     if not client_id:
-        return jsonify({"error": "Client ID is required"}), 400
+        logger.error(f"Missing clientId. Form data: {dict(request.form)}")
+        return jsonify({
+            "error": "Client ID is required",
+            "received_fields": list(request.form.keys()),
+            "received_files": list(request.files.keys())
+        }), 400
     
     # Verify client belongs to user
     try:
         client_id = int(client_id)
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT Id FROM Clients WHERE Id = ? AND UserId = ?", (client_id, user_id))
-        if not cursor.fetchone():
-            conn.close()
-            return jsonify({"error": "Invalid client ID"}), 403
-        conn.close()
-    except Exception as e:
-        return jsonify({"error": "Invalid client ID"}), 400
-    
+    except ValueError:
+        return jsonify({
+            "error": f"Invalid client ID format: {client_id}", 
+            "code": "INVALID_CLIENT_ID"
+        }), 400
+        
+    if not verify_client_ownership(client_id, user_id):
+            return jsonify({"error": "Invalid client ID or access denied"}), 403
+        
     # Check document quota
     can_process, error_msg = check_document_quota()
     if not can_process:
@@ -400,13 +479,14 @@ def analyze_document_route():
             "quota": user.get('document_quota', 0)
         }), 403
     
+    # Validate file upload
     if 'file' not in request.files:
         return jsonify({"error": "No file part"}), 400
-    
     file = request.files['file']
     if file.filename == '':
         return jsonify({"error": "No selected file"}), 400
-
+    
+    # Extract form parameters
     title = request.form.get('title', file.filename)
     classification = request.form.get('classification', 'auto')
     language = request.form.get('language', 'en')
@@ -414,28 +494,32 @@ def analyze_document_route():
     priority = request.form.get('priority', 'normal')
     practice_area = request.form.get('practiceArea', '')
     tags = request.form.get('tags', '')
-
+    
     start_time = time.time()
     filename = file.filename
     original_name = filename
     file_size = len(file.read())
-    file.seek(0)
+    file.seek(0)  # Reset file pointer after reading size
     
+    # Save file to disk
     filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
     file.save(filepath)
-
+    
+    # Extract text from file
     raw_text = extract_text_with_ocr(filepath)
     if raw_text is None:
+        # Clean up file if extraction fails
+        if os.path.exists(filepath):
+            os.remove(filepath)
         return jsonify({"error": "Could not read file or extract text"}), 500
-
-    cleaned_text = clean_extracted_text(raw_text)
     
+    cleaned_text = clean_extracted_text(raw_text)
     conn = get_db_connection()
     cursor = conn.cursor()
     creation_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     
+    # 🔥 FIX: Try to insert with composite key (user_id + client_id + filename)
     try:
-        # Insert with user_id and client_id
         cursor.execute("""
             INSERT INTO cases(
                 filename, title, file_size, extracted_text, classification, 
@@ -446,22 +530,60 @@ def analyze_document_route():
         """, (filename, title, file_size, raw_text, classification, enable_ocr, 
               filepath, creation_date, original_name, priority, tags, user_id, client_id))
         conn.commit()
-        
         cursor.execute("SELECT SCOPE_IDENTITY()")
         document_id = cursor.fetchone()[0]
+        
     except pyodbc.IntegrityError:
-        cursor.execute("SELECT id FROM cases WHERE filename = ?", (filename,))
+        conn.rollback()  # Rollback failed transaction
+        
+        # 🔥 Check if duplicate exists for SAME user + SAME client + SAME filename
+        cursor.execute(
+            "SELECT id, status FROM cases WHERE filename = ? AND user_id = ? AND client_id = ?", 
+            (filename, user_id, client_id)
+        )
         result = cursor.fetchone()
+        
         if result:
-            document_id = result[0]
-        else:
+            # ✅ Document already exists for this client - return friendly duplicate response
+            existing_id, existing_status = result
             conn.close()
-            return jsonify({"error": "Database error"}), 500
-
+            
+            # 🔥 Return 200 OK with special status for frontend to handle
+            return jsonify({
+                "status": "duplicate",  # ← Special status for frontend
+                "message": f"Document '{filename}' already exists for this client",
+                "id": existing_id,
+                "filename": filename,
+                "existing_status": existing_status,
+                "user_id": user_id,
+                "client_id": client_id
+            }), 200  # ← Return 200, not an error!
+        else:
+            # Filename exists for DIFFERENT user or client - allow it with unique name
+            unique_filename = f"{filename.rsplit('.', 1)[0]}_{int(time.time())}.{filename.rsplit('.', 1)[-1]}"
+            filepath = os.path.join(app.config['UPLOAD_FOLDER'], unique_filename)
+            file.seek(0)
+            file.save(filepath)  # Re-save with unique name
+            
+            # Retry insert with unique filename
+            cursor.execute("""
+                INSERT INTO cases(filename, title, file_size, extracted_text, classification, 
+                    enable_ocr, file_path, status, creation_date, original_name, 
+                    priority, tags, user_id, client_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'Processing', ?, ?, ?, ?, ?, ?)
+            """, (unique_filename, title, file_size, raw_text, classification, enable_ocr, 
+                  filepath, creation_date, original_name, priority, tags, user_id, client_id))
+            conn.commit()
+            cursor.execute("SELECT SCOPE_IDENTITY()")
+            document_id = cursor.fetchone()[0]
+            filename = unique_filename  # Update filename for response
+    
+    # Perform Gemini AI analysis
     analysis = perform_gemini_analysis(cleaned_text)
     analysis_duration = int((time.time() - start_time) * 1000)
     analyzed_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
+    
+    # Handle analysis failure
     if analysis is None:
         cursor.execute("""
             UPDATE cases 
@@ -470,22 +592,31 @@ def analyze_document_route():
         """, (analysis_duration, document_id))
         conn.commit()
         conn.close()
+        # Clean up file on error
+        if os.path.exists(filepath):
+            os.remove(filepath)
         return jsonify({"error": "AI analysis failed"}), 500
-
+    
+    # Auto-detect practice area if not provided
     if not practice_area:
         practice_area = detect_practice_area(cleaned_text, analysis.get('document_type'), 
-                                             analysis.get('parties'))
+                                            analysis.get('parties'))
     
+    # Auto-detect priority if normal
     if priority == 'normal':
         detected_priority = determine_priority(cleaned_text, analysis.get('document_type'), 
-                                               analysis.get('parties'))
+                                              analysis.get('parties'))
         if detected_priority != 'normal':
             priority = detected_priority
-
+    
+    # Calculate confidence score
     confidence_score = calculate_confidence_score(analysis, len(cleaned_text))
     needs_review = confidence_score < 0.7
+    
+    # Format arguments for storage
     arguments_str = "||".join(analysis.get('arguments', []))
-
+    
+    # Update document record with analysis results
     cursor.execute("""
         UPDATE cases 
         SET summary = ?, parties = ?, document_date = ?, court = ?, arguments = ?, 
@@ -504,10 +635,11 @@ def analyze_document_route():
         update_user_document_count(user_id)
     except Exception as e:
         logger.error(f"Failed to update user document count: {e}")
+        # Continue even if this fails - it's not critical
     
     conn.close()
     
-    # Log the action
+    # Log the action for audit trail
     log_user_action('document_analyzed', {
         'document_id': document_id,
         'filename': filename,
@@ -515,7 +647,8 @@ def analyze_document_route():
         'client_id': client_id,
         'status': 'success'
     })
-
+    
+    # Return success response
     return jsonify({
         "status": "success",
         "filename": filename,
@@ -536,7 +669,6 @@ def update_user_document_count(user_id):
         conn = get_db_connection()
         cursor = conn.cursor()
         
-        # Increment documents processed this month
         cursor.execute("""
             UPDATE Users 
             SET DocumentsProcessedThisMonth = DocumentsProcessedThisMonth + 1
@@ -550,43 +682,65 @@ def update_user_document_count(user_id):
         raise
 
 @app.route('/cases', methods=['GET'])
+@require_auth
 def get_all_cases():
     return get_documents()
 
 @app.route('/documents', methods=['GET'])
 @require_auth
 def get_documents():
+    """
+    Get all documents with proper client isolation and filtering.
+    Non-admin users only see documents for their selected client.
+    """
     user = get_user_from_token()
+    if not user:
+        return jsonify({"error": "Authentication required"}), 401
+        
     user_id = user.get('user_id')
     user_roles = user.get('roles', [])
     
-    # Admin and Manager can see all documents
+    # Admin and Manager can see all documents; regular users see only their client's docs
     is_admin = 'Admin' in user_roles or 'Manager' in user_roles
     
-    # Get all filter parameters
+    # Get all filter parameters from query string
     date_range = request.args.get('dateRange', 'all')
     document_type = request.args.get('documentType', 'all')
     practice_area = request.args.get('practiceArea', 'all')
     status = request.args.get('status', 'all')
     priority = request.args.get('priority', 'all')
     needs_review = request.args.get('needsReview', 'all')
-    client_id = request.args.get('clientId')  # New client filter
-
+    client_id = request.args.get('clientId')  # ← Critical: Client filter
+    
     conn = get_db_connection()
     cursor = conn.cursor()
-    
     where_conditions = []
     params = []
     
-    # Role-based filtering
+    # 🔐 CRITICAL: Role-based filtering - non-admin users only see their own documents
     if not is_admin:
         where_conditions.append("user_id = ?")
         params.append(user_id)
+        
+        # 🔥 FIX: If no clientId provided for non-admin, return empty list
+        # This enforces client selection before viewing documents
+        if not client_id:
+            conn.close()
+            return jsonify([])
     
-    # Client filter - filter by specific client
+    # 🔥 FIX: Client filter - ALWAYS apply when clientId is provided
     if client_id:
-        where_conditions.append("client_id = ?")
-        params.append(int(client_id))
+        try:
+            client_id_int = int(client_id)
+            # Verify client belongs to user (unless admin)
+            if not is_admin and not verify_client_ownership(client_id_int, user_id):
+                conn.close()
+                return jsonify({"error": "Access denied to this client"}), 403
+            where_conditions.append("client_id = ?")
+            params.append(client_id_int)
+        except ValueError:
+            conn.close()
+            return jsonify({"error": "Invalid client ID"}), 400
     
     # Date range filter
     if date_range != 'all':
@@ -594,34 +748,34 @@ def get_documents():
         if days:
             where_conditions.append("creation_date >= ?")
             params.append((datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d"))
-
+    
     # Document type filter
     if document_type != 'all':
         where_conditions.append("LOWER(document_type) LIKE ?")
         params.append(f"%{document_type.lower()}%")
-
+    
     # Practice area filter
     if practice_area != 'all':
         where_conditions.append("LOWER(practice_area) LIKE ?")
         params.append(f"%{practice_area.lower()}%")
-
+    
     # Status filter
     if status != 'all':
         where_conditions.append("status = ?")
         params.append(status)
-
+    
     # Priority filter
     if priority != 'all':
         where_conditions.append("priority = ?")
         params.append(priority)
-
+    
     # Needs review filter
     if needs_review == 'true':
         where_conditions.append("needs_review = 1")
     elif needs_review == 'false':
         where_conditions.append("needs_review = 0")
-
-    # Build query with client_id included in SELECT
+    
+    # Build the base query
     base_query = """
         SELECT id, filename, original_name, title, summary, parties, document_date, court, 
                arguments, document_type, creation_date, document_language, file_size, 
@@ -630,53 +784,110 @@ def get_documents():
         FROM cases
     """
     
-    query = base_query + (" WHERE " + " AND ".join(where_conditions) if where_conditions else "") + " ORDER BY id DESC"
+    # Add WHERE clause if we have conditions
+    if where_conditions:
+        query = base_query + " WHERE " + " AND ".join(where_conditions) + " ORDER BY creation_date DESC"
+    else:
+        query = base_query + " ORDER BY creation_date DESC"
     
     cursor.execute(query, params)
     rows = cursor.fetchall()
-
+    
+    # Convert rows to list of dictionaries
     cases = []
     for row in rows:
         case_dict = dict(zip([col[0] for col in cursor.description], row))
+        # Convert datetime objects to ISO format strings for JSON serialization
         for key, value in case_dict.items():
             if isinstance(value, datetime):
                 case_dict[key] = value.isoformat()
         cases.append(case_dict)
-
+    
     conn.close()
     return jsonify(cases)
 
 @app.route('/analytics', methods=['GET'])
+@require_auth
 def get_analytics():
+    user = get_user_from_token()
+    user_id = user.get('user_id')
+    user_roles = user.get('roles', [])
+    is_admin = 'Admin' in user_roles or 'Manager' in user_roles
+    
+    client_id = request.args.get('clientId')
+    
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT document_type, COUNT(*) FROM cases WHERE status='Analyzed' GROUP BY document_type")
+    
+    # Build WHERE clause for user/client filtering
+    where_clause = ""
+    params = []
+    
+    if not is_admin:
+        where_clause = "WHERE user_id = ?"
+        params = [user_id]
+    
+    if client_id:
+        client_id_int = int(client_id)
+        if not is_admin and not verify_client_ownership(client_id_int, user_id):
+            return jsonify({"error": "Access denied"}), 403
+        
+        if where_clause:
+            where_clause += " AND client_id = ?"
+        else:
+            where_clause = "WHERE client_id = ?"
+        params.append(client_id_int)
+    
+    # Document types
+    query = f"SELECT document_type, COUNT(*) FROM cases {where_clause} AND status='Analyzed' GROUP BY document_type"
+    cursor.execute(query, params)
     doc_types = [{"type": row[0], "count": row[1]} for row in cursor.fetchall()]
-    cursor.execute("SELECT practice_area, COUNT(*) FROM cases WHERE status='Analyzed' AND practice_area IS NOT NULL GROUP BY practice_area")
+    
+    # Practice areas
+    query = f"SELECT practice_area, COUNT(*) FROM cases {where_clause} AND status='Analyzed' AND practice_area IS NOT NULL GROUP BY practice_area"
+    cursor.execute(query, params)
     practice_areas = [{"area": row[0], "count": row[1]} for row in cursor.fetchall()]
-    cursor.execute("SELECT document_language, COUNT(*) FROM cases WHERE status='Analyzed' GROUP BY document_language")
+    
+    # Languages
+    query = f"SELECT document_language, COUNT(*) FROM cases {where_clause} AND status='Analyzed' GROUP BY document_language"
+    cursor.execute(query, params)
     languages = [{"language": row[0], "count": row[1]} for row in cursor.fetchall()]
-    cursor.execute("SELECT priority, COUNT(*) FROM cases GROUP BY priority")
+    
+    # Priorities
+    query = f"SELECT priority, COUNT(*) FROM cases {where_clause} GROUP BY priority"
+    cursor.execute(query, params)
     priorities = [{"priority": row[0], "count": row[1]} for row in cursor.fetchall()]
-    cursor.execute("SELECT status, COUNT(*) FROM cases GROUP BY status")
+    
+    # Status counts
+    query = f"SELECT status, COUNT(*) FROM cases {where_clause} GROUP BY status"
+    cursor.execute(query, params)
     status_counts = {row[0]: row[1] for row in cursor.fetchall()}
     
-    cursor.execute("SELECT AVG(CAST(analysis_duration_ms AS FLOAT)) FROM cases WHERE status='Analyzed' AND analysis_duration_ms IS NOT NULL")
+    # Average duration
+    query = f"SELECT AVG(CAST(analysis_duration_ms AS FLOAT)) FROM cases {where_clause} AND status='Analyzed' AND analysis_duration_ms IS NOT NULL"
+    cursor.execute(query, params)
     avg_duration_row = cursor.fetchone()
     avg_duration = int(avg_duration_row[0]) if avg_duration_row and avg_duration_row[0] is not None else 0
     
-    cursor.execute("SELECT AVG(confidence_score) FROM cases WHERE status='Analyzed' AND confidence_score IS NOT NULL")
+    # Average confidence
+    query = f"SELECT AVG(confidence_score) FROM cases {where_clause} AND status='Analyzed' AND confidence_score IS NOT NULL"
+    cursor.execute(query, params)
     avg_confidence_row = cursor.fetchone()
     avg_confidence = float(avg_confidence_row[0]) if avg_confidence_row and avg_confidence_row[0] is not None else 0.0
     
-    cursor.execute("SELECT SUM(file_size) FROM cases")
+    # Total size
+    query = f"SELECT SUM(file_size) FROM cases {where_clause}"
+    cursor.execute(query, params)
     total_size_row = cursor.fetchone()
     total_size = total_size_row[0] if total_size_row and total_size_row[0] is not None else 0
     
-    total_documents = sum(status_counts.values())
-    cursor.execute("SELECT COUNT(*) FROM cases WHERE needs_review = 1")
+    # Needs review count
+    query = f"SELECT COUNT(*) FROM cases {where_clause} AND needs_review = 1"
+    cursor.execute(query, params)
     needs_review_count_row = cursor.fetchone()
     needs_review_count = needs_review_count_row[0] if needs_review_count_row else 0
+    
+    total_documents = sum(status_counts.values())
     
     conn.close()
     return jsonify({
@@ -696,6 +907,216 @@ def get_analytics():
             "needs_review": needs_review_count
         }
     })
+
+@app.route('/clients', methods=['GET'])
+@require_auth
+def get_clients():
+    """Get all clients belonging to the current user"""
+    user = get_user_from_token()
+    user_id = user.get('user_id')
+    user_roles = user.get('roles', [])
+    is_admin = 'Admin' in user_roles or 'Manager' in user_roles
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    if is_admin:
+        # Admins see all clients
+        cursor.execute("""
+            SELECT Id, Name, Email, Phone, Address, UserId, CreatedAt, UpdatedAt
+            FROM Clients
+            ORDER BY Name
+        """)
+    else:
+        # Regular users only see their own clients
+        cursor.execute("""
+            SELECT Id, Name, Email, Phone, Address, UserId, CreatedAt, UpdatedAt
+            FROM Clients
+            WHERE UserId = ?
+            ORDER BY Name
+        """, (user_id,))
+    
+    rows = cursor.fetchall()
+    clients = []
+    for row in rows:
+        clients.append({
+            'id': row[0],
+            'name': row[1],
+            'email': row[2],
+            'phone': row[3],
+            'address': row[4],
+            'userId': row[5],
+            'createdAt': row[6].isoformat() if row[6] else None,
+            'updatedAt': row[7].isoformat() if row[7] else None
+        })
+    
+    conn.close()
+    return jsonify(clients)
+
+@app.route('/clients', methods=['POST'])
+@require_auth
+def create_client():
+    """Create a new client for the current user"""
+    user = get_user_from_token()
+    user_id = user.get('user_id')
+    
+    data = request.get_json()
+    if not data or not data.get('name'):
+        return jsonify({"error": "Client name is required"}), 400
+    
+    name = data.get('name')
+    email = data.get('email', '')
+    phone = data.get('phone', '')
+    address = data.get('address', '')
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute("""
+            INSERT INTO Clients (Name, Email, Phone, Address, UserId, CreatedAt, UpdatedAt)
+            VALUES (?, ?, ?, ?, ?, GETDATE(), GETDATE())
+        """, (name, email, phone, address, user_id))
+        
+        conn.commit()
+        
+        cursor.execute("SELECT SCOPE_IDENTITY()")
+        client_id = cursor.fetchone()[0]
+        
+        conn.close()
+        
+        log_user_action('client_created', {
+            'client_id': client_id,
+            'name': name
+        })
+        
+        return jsonify({
+            "status": "success",
+            "id": client_id,
+            "name": name,
+            "userId": user_id
+        }), 201
+        
+    except Exception as e:
+        conn.close()
+        logger.error(f"Error creating client: {e}")
+        return jsonify({"error": "Failed to create client"}), 500
+
+@app.route('/clients/<int:client_id>', methods=['GET'])
+@require_auth
+def get_client_by_id(client_id):
+    """Get a specific client (with ownership verification)"""
+    user = get_user_from_token()
+    user_id = user.get('user_id')
+    user_roles = user.get('roles', [])
+    is_admin = 'Admin' in user_roles or 'Manager' in user_roles
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    if is_admin:
+        cursor.execute("""
+            SELECT Id, Name, Email, Phone, Address, UserId, CreatedAt, UpdatedAt
+            FROM Clients WHERE Id = ?
+        """, (client_id,))
+    else:
+        cursor.execute("""
+            SELECT Id, Name, Email, Phone, Address, UserId, CreatedAt, UpdatedAt
+            FROM Clients WHERE Id = ? AND UserId = ?
+        """, (client_id, user_id))
+    
+    row = cursor.fetchone()
+    conn.close()
+    
+    if not row:
+        return jsonify({"error": "Client not found or access denied"}), 404
+    
+    return jsonify({
+        'id': row[0],
+        'name': row[1],
+        'email': row[2],
+        'phone': row[3],
+        'address': row[4],
+        'userId': row[5],
+        'createdAt': row[6].isoformat() if row[6] else None,
+        'updatedAt': row[7].isoformat() if row[7] else None
+    })
+
+@app.route('/clients/<int:client_id>', methods=['PUT'])
+@require_auth
+def update_client(client_id):
+    """Update a client (with ownership verification)"""
+    user = get_user_from_token()
+    user_id = user.get('user_id')
+    
+    if not verify_client_ownership(client_id, user_id):
+        return jsonify({"error": "Access denied"}), 403
+    
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "No data provided"}), 400
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    update_fields = []
+    params = []
+    
+    if 'name' in data:
+        update_fields.append("Name = ?")
+        params.append(data['name'])
+    if 'email' in data:
+        update_fields.append("Email = ?")
+        params.append(data['email'])
+    if 'phone' in data:
+        update_fields.append("Phone = ?")
+        params.append(data['phone'])
+    if 'address' in data:
+        update_fields.append("Address = ?")
+        params.append(data['address'])
+    
+    if not update_fields:
+        conn.close()
+        return jsonify({"error": "No valid fields to update"}), 400
+    
+    update_fields.append("UpdatedAt = GETDATE()")
+    params.append(client_id)
+    
+    query = f"UPDATE Clients SET {', '.join(update_fields)} WHERE Id = ?"
+    cursor.execute(query, params)
+    conn.commit()
+    conn.close()
+    
+    return jsonify({"status": "success"}), 200
+
+@app.route('/clients/<int:client_id>', methods=['DELETE'])
+@require_auth
+def delete_client(client_id):
+    """Delete a client (with ownership verification)"""
+    user = get_user_from_token()
+    user_id = user.get('user_id')
+    
+    if not verify_client_ownership(client_id, user_id):
+        return jsonify({"error": "Access denied"}), 403
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    # Check if client has documents
+    cursor.execute("SELECT COUNT(*) FROM cases WHERE client_id = ?", (client_id,))
+    doc_count = cursor.fetchone()[0]
+    
+    if doc_count > 0:
+        conn.close()
+        return jsonify({
+            "error": f"Cannot delete client with {doc_count} documents. Please delete or reassign documents first."
+        }), 400
+    
+    cursor.execute("DELETE FROM Clients WHERE Id = ?", (client_id,))
+    conn.commit()
+    conn.close()
+    
+    return jsonify({"status": "success"}), 200
 
 @app.route('/microservices/health', methods=['GET'])
 def check_microservices_health():
@@ -734,65 +1155,171 @@ def check_microservices_health():
         return jsonify({"overall_status": "unhealthy", "error": str(e), "timestamp": datetime.now().isoformat()}), 500
 
 @app.route('/practice-areas', methods=['GET'])
+@require_auth
 def get_practice_areas():
+    user = get_user_from_token()
+    user_id = user.get('user_id')
+    user_roles = user.get('roles', [])
+    is_admin = 'Admin' in user_roles or 'Manager' in user_roles
+    
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("""
-        SELECT practice_area, COUNT(*) as count
-        FROM cases
-        WHERE practice_area IS NOT NULL AND practice_area != ''
-        GROUP BY practice_area
-        ORDER BY count DESC
-    """)
+    
+    if is_admin:
+        cursor.execute("""
+            SELECT practice_area, COUNT(*) as count
+            FROM cases
+            WHERE practice_area IS NOT NULL AND practice_area != ''
+            GROUP BY practice_area
+            ORDER BY count DESC
+        """)
+    else:
+        cursor.execute("""
+            SELECT practice_area, COUNT(*) as count
+            FROM cases
+            WHERE practice_area IS NOT NULL AND practice_area != '' AND user_id = ?
+            GROUP BY practice_area
+            ORDER BY count DESC
+        """, (user_id,))
+    
     rows = cursor.fetchall()
     practice_areas = [{"area": row[0], "count": row[1]} for row in rows]
     conn.close()
     return jsonify(practice_areas)
 
 @app.route('/quick-filters', methods=['GET'])
+@require_auth
 def get_quick_filter_stats():
+    user = get_user_from_token()
+    user_id = user.get('user_id')
+    user_roles = user.get('roles', [])
+    is_admin = 'Admin' in user_roles or 'Manager' in user_roles
+    
+    client_id = request.args.get('clientId')
+    
     conn = get_db_connection()
     cursor = conn.cursor()
     today = datetime.now().strftime("%Y-%m-%d")
     tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+    
+    where_clause = ""
+    params = []
+    
+    if not is_admin:
+        where_clause = "WHERE user_id = ?"
+        params = [user_id]
+    
+    if client_id:
+        client_id_int = int(client_id)
+        if not is_admin and not verify_client_ownership(client_id_int, user_id):
+            return jsonify({"error": "Access denied"}), 403
+        
+        if where_clause:
+            where_clause += " AND client_id = ?"
+        else:
+            where_clause = "WHERE client_id = ?"
+        params.append(client_id_int)
+    
     stats = {}
-    cursor.execute("SELECT COUNT(*) FROM cases WHERE priority IN ('high', 'urgent')")
+    
+    # High priority
+    query = f"SELECT COUNT(*) FROM cases {where_clause}"
+    if where_clause:
+        query += " AND priority IN ('high', 'urgent')"
+    else:
+        query += " WHERE priority IN ('high', 'urgent')"
+    cursor.execute(query, params)
     stats['high_priority'] = cursor.fetchone()[0]
-    cursor.execute("SELECT COUNT(*) FROM cases WHERE analyzed_at >= ? AND analyzed_at < ?", (today, tomorrow))
+    
+    # Completed today
+    query = f"SELECT COUNT(*) FROM cases {where_clause}"
+    today_params = params + [today, tomorrow]
+    if where_clause:
+        query += " AND analyzed_at >= ? AND analyzed_at < ?"
+    else:
+        query += " WHERE analyzed_at >= ? AND analyzed_at < ?"
+    cursor.execute(query, today_params)
     stats['completed_today'] = cursor.fetchone()[0]
-    cursor.execute("SELECT COUNT(*) FROM cases WHERE needs_review = 1")
+    
+    # Needs review
+    query = f"SELECT COUNT(*) FROM cases {where_clause}"
+    if where_clause:
+        query += " AND needs_review = 1"
+    else:
+        query += " WHERE needs_review = 1"
+    cursor.execute(query, params)
     stats['needs_review'] = cursor.fetchone()[0]
-    cursor.execute("SELECT COUNT(*) FROM cases WHERE status = 'Error'")
+    
+    # Processing errors
+    query = f"SELECT COUNT(*) FROM cases {where_clause}"
+    if where_clause:
+        query += " AND status = 'Error'"
+    else:
+        query += " WHERE status = 'Error'"
+    cursor.execute(query, params)
     stats['processing_errors'] = cursor.fetchone()[0]
-    cursor.execute("SELECT COUNT(*) FROM cases WHERE confidence_score < 0.6 AND confidence_score IS NOT NULL")
+    
+    # Low confidence
+    query = f"SELECT COUNT(*) FROM cases {where_clause}"
+    if where_clause:
+        query += " AND confidence_score < 0.6 AND confidence_score IS NOT NULL"
+    else:
+        query += " WHERE confidence_score < 0.6 AND confidence_score IS NOT NULL"
+    cursor.execute(query, params)
     stats['low_confidence'] = cursor.fetchone()[0]
+    
     conn.close()
     return jsonify(stats)
 
 @app.route('/cases/<int:case_id>/update-metadata', methods=['PATCH'])
+@require_auth
 def update_case_enhanced_metadata(case_id):
+    user = get_user_from_token()
+    user_id = user.get('user_id')
+    user_roles = user.get('roles', [])
+    is_admin = 'Admin' in user_roles or 'Manager' in user_roles
+    
     data = request.get_json()
     if not data:
         return jsonify({"error": "No data provided"}), 400
+    
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT id FROM cases WHERE id = ?", (case_id,))
+    
+    # Verify ownership
+    if is_admin:
+        cursor.execute("SELECT id FROM cases WHERE id = ?", (case_id,))
+    else:
+        cursor.execute("SELECT id FROM cases WHERE id = ? AND user_id = ?", (case_id, user_id))
+    
     if not cursor.fetchone():
         conn.close()
-        return jsonify({"error": "Case not found"}), 404
-    allowed_fields = {'title': 'title', 'classification': 'classification', 'enable_ocr': 'enable_ocr',
-                      'practice_area': 'practice_area', 'priority': 'priority', 'needs_review': 'needs_review', 'tags': 'tags'}
+        return jsonify({"error": "Case not found or access denied"}), 404
+    
+    allowed_fields = {
+        'title': 'title', 
+        'classification': 'classification', 
+        'enable_ocr': 'enable_ocr',
+        'practice_area': 'practice_area', 
+        'priority': 'priority', 
+        'needs_review': 'needs_review', 
+        'tags': 'tags'
+    }
+    
     update_fields = []
     update_values = []
     for field, db_col in allowed_fields.items():
         if field in data:
             update_fields.append(f"{db_col} = ?")
             update_values.append(data[field])
+    
     if not update_fields:
         conn.close()
         return jsonify({"error": "No valid fields to update"}), 400
+    
     update_fields.append("updated_at = GETDATE()")
     update_values.append(case_id)
+    
     query = f"UPDATE cases SET {', '.join(update_fields)} WHERE id = ?"
     cursor.execute(query, update_values)
     conn.commit()
@@ -800,9 +1327,25 @@ def update_case_enhanced_metadata(case_id):
     return jsonify({"status": "success", "message": "Case metadata updated successfully"}), 200
 
 @app.route('/batch-upload', methods=['POST'])
+@require_auth
 def batch_upload_documents():
+    user = get_user_from_token()
+    user_id = user.get('user_id')
+    
+    client_id = request.form.get('clientId')
+    if not client_id:
+        return jsonify({"error": "Client ID is required"}), 400
+    
+    try:
+        client_id = int(client_id)
+        if not verify_client_ownership(client_id, user_id):
+            return jsonify({"error": "Invalid client ID or access denied"}), 403
+    except ValueError:
+        return jsonify({"error": "Invalid client ID format"}), 400
+    
     if 'files' not in request.files:
         return jsonify({"error": "No files provided"}), 400
+    
     files = request.files.getlist('files')
     if not files or all(f.filename == '' for f in files):
         return jsonify({"error": "No files selected"}), 400
@@ -865,12 +1408,12 @@ def batch_upload_documents():
                 cursor.execute("""
                     INSERT INTO cases(filename, original_name, title, summary, parties, document_date, court, arguments, document_type,
                     creation_date, document_language, file_size, extracted_text, analysis_duration_ms, classification, enable_ocr, file_path,
-                    status, practice_area, priority, confidence_score, needs_review, analyzed_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Analyzed', ?, ?, ?, ?, ?)
+                    status, practice_area, priority, confidence_score, needs_review, analyzed_at, user_id, client_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Analyzed', ?, ?, ?, ?, ?, ?, ?)
                 """, (filename, original_name, title, analysis.get('summary'), analysis.get('parties'), analysis.get('document_date'),
                       analysis.get('court'), arguments_str, analysis.get('document_type'), creation_date, analysis.get('document_language'),
                       file_size, raw_text, analysis_duration, classification, enable_ocr, filepath, practice_area, priority,
-                      confidence_score, needs_review, analyzed_at))
+                      confidence_score, needs_review, analyzed_at, user_id, client_id))
                 conn.commit()
                 cursor.execute("SELECT SCOPE_IDENTITY()")
                 document_id = cursor.fetchone()[0]
@@ -891,14 +1434,27 @@ def batch_upload_documents():
     return jsonify({"results": results}), 200
 
 @app.route('/cases/<int:case_id>/reanalyze', methods=['POST'])
+@require_auth
 def reanalyze_single_document(case_id):
+    user = get_user_from_token()
+    user_id = user.get('user_id')
+    user_roles = user.get('roles', [])
+    is_admin = 'Admin' in user_roles or 'Manager' in user_roles
+    
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT id, filename, file_path FROM cases WHERE id = ?", (case_id,))
+    
+    # Verify ownership
+    if is_admin:
+        cursor.execute("SELECT id, filename, file_path FROM cases WHERE id = ?", (case_id,))
+    else:
+        cursor.execute("SELECT id, filename, file_path FROM cases WHERE id = ? AND user_id = ?", (case_id, user_id))
+    
     row = cursor.fetchone()
     if not row:
         conn.close()
-        return jsonify({"error": "Case not found"}), 404
+        return jsonify({"error": "Case not found or access denied"}), 404
+    
     _, _, file_path = row
     if not file_path or not os.path.exists(file_path):
         conn.close()
@@ -948,7 +1504,13 @@ def reanalyze_single_document(case_id):
         return jsonify({"error": str(e)}), 500
 
 @app.route('/reanalyze-all', methods=['POST'])
+@require_auth
+@require_role('Admin')
 def reanalyze_all_documents():
+    """Admin-only: Re-analyze all documents"""
+    user = get_user_from_token()
+    user_id = user.get('user_id')
+    
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT id, filename, file_path, enable_ocr FROM cases")
@@ -1003,19 +1565,36 @@ def reanalyze_all_documents():
     }), 200
 
 @app.route('/cases/<int:case_id>', methods=['GET'])
+@require_auth
 def get_case_by_id(case_id):
+    user = get_user_from_token()
+    user_id = user.get('user_id')
+    user_roles = user.get('roles', [])
+    is_admin = 'Admin' in user_roles or 'Manager' in user_roles
+    
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("""
-        SELECT id, filename, original_name, title, summary, parties, document_date, court, arguments, document_type,
-               creation_date, document_language, file_size, extracted_text, analysis_duration_ms, classification, status,
-               practice_area, priority, confidence_score, needs_review, tags, updated_at, analyzed_at
-        FROM cases WHERE id = ?
-    """, (case_id,))
+    
+    if is_admin:
+        cursor.execute("""
+            SELECT id, filename, original_name, title, summary, parties, document_date, court, arguments, document_type,
+                   creation_date, document_language, file_size, extracted_text, analysis_duration_ms, classification, status,
+                   practice_area, priority, confidence_score, needs_review, tags, updated_at, analyzed_at, user_id, client_id
+            FROM cases WHERE id = ?
+        """, (case_id,))
+    else:
+        cursor.execute("""
+            SELECT id, filename, original_name, title, summary, parties, document_date, court, arguments, document_type,
+                   creation_date, document_language, file_size, extracted_text, analysis_duration_ms, classification, status,
+                   practice_area, priority, confidence_score, needs_review, tags, updated_at, analyzed_at, user_id, client_id
+            FROM cases WHERE id = ? AND user_id = ?
+        """, (case_id, user_id))
+    
     row = cursor.fetchone()
     if not row:
         conn.close()
-        return jsonify({"error": "Case not found"}), 404
+        return jsonify({"error": "Case not found or access denied"}), 404
+    
     case = dict(zip([col[0] for col in cursor.description], row))
     for key, value in case.items():
         if isinstance(value, datetime):
@@ -1024,12 +1603,28 @@ def get_case_by_id(case_id):
     return jsonify(case)
 
 @app.route('/cases/<int:case_id>', methods=['DELETE'])
+@require_auth
 def delete_case(case_id):
+    user = get_user_from_token()
+    user_id = user.get('user_id')
+    user_roles = user.get('roles', [])
+    is_admin = 'Admin' in user_roles or 'Manager' in user_roles
+    
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT file_path FROM cases WHERE id = ?", (case_id,))
+    
+    # Verify ownership
+    if is_admin:
+        cursor.execute("SELECT file_path FROM cases WHERE id = ?", (case_id,))
+    else:
+        cursor.execute("SELECT file_path FROM cases WHERE id = ? AND user_id = ?", (case_id, user_id))
+    
     row = cursor.fetchone()
-    if row and row[0]:
+    if not row:
+        conn.close()
+        return jsonify({"error": "Case not found or access denied"}), 404
+    
+    if row[0]:
         file_path = row[0]
         if os.path.exists(file_path):
             try:
@@ -1037,10 +1632,8 @@ def delete_case(case_id):
                 logger.info(f"Deleted file: {file_path}")
             except Exception as e:
                 logger.error(f"Failed to delete file {file_path}: {e}")
+    
     cursor.execute("DELETE FROM cases WHERE id = ?", (case_id,))
-    if cursor.rowcount == 0:
-        conn.close()
-        return jsonify({"error": "Case not found"}), 404
     conn.commit()
     conn.close()
     return jsonify({"status": "deleted"}), 200
@@ -1054,28 +1647,44 @@ def search_cases():
     is_admin = 'Admin' in user_roles or 'Manager' in user_roles
     
     keyword = request.args.get('keyword', '') or request.args.get('query', '')
+    client_id = request.args.get('clientId')
+    
     if not keyword:
         return jsonify([])
 
-    query = f"%{keyword}%"
+    query_param = f"%{keyword}%"
     conn = get_db_connection()
     cursor = conn.cursor()
 
-    # Add user_id filter for non-admin users
-    user_filter = "" if is_admin else "AND user_id = ?"
-    params = [query] * 8
+    where_conditions = [
+        "(filename LIKE ? OR title LIKE ? OR summary LIKE ? OR parties LIKE ? OR court LIKE ? OR document_type LIKE ? OR practice_area LIKE ? OR tags LIKE ?)"
+    ]
+    params = [query_param] * 8
+    
+    # User filter
     if not is_admin:
+        where_conditions.append("user_id = ?")
         params.append(user_id)
+    
+    # Client filter
+    if client_id:
+        try:
+            client_id_int = int(client_id)
+            if not is_admin and not verify_client_ownership(client_id_int, user_id):
+                return jsonify({"error": "Access denied"}), 403
+            
+            where_conditions.append("client_id = ?")
+            params.append(client_id_int)
+        except ValueError:
+            return jsonify({"error": "Invalid client ID"}), 400
 
     cursor.execute(f"""
         SELECT id, filename, original_name, title, summary, parties, document_date, court, 
                arguments, document_type, creation_date, document_language, file_size, 
                analysis_duration_ms, status, practice_area, priority, confidence_score, 
-               needs_review, tags
+               needs_review, tags, user_id, client_id
         FROM cases
-        WHERE (filename LIKE ? OR title LIKE ? OR summary LIKE ? OR parties LIKE ? 
-               OR court LIKE ? OR document_type LIKE ? OR practice_area LIKE ? OR tags LIKE ?)
-        {user_filter}
+        WHERE {' AND '.join(where_conditions)}
         ORDER BY id DESC
     """, params)
     
@@ -1093,10 +1702,23 @@ def search_cases():
     return jsonify(cases)
 
 @app.route('/trends', methods=['GET'])
+@require_auth
 def get_trends():
+    user = get_user_from_token()
+    user_id = user.get('user_id')
+    user_roles = user.get('roles', [])
+    is_admin = 'Admin' in user_roles or 'Manager' in user_roles
+    
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT parties FROM cases WHERE status='Analyzed'")
+    
+    where_clause = "WHERE status='Analyzed'"
+    params = []
+    if not is_admin:
+        where_clause += " AND user_id = ?"
+        params.append(user_id)
+    
+    cursor.execute(f"SELECT parties FROM cases {where_clause}", params)
     all_entities = []
     for row in cursor.fetchall():
         parties = row[0] or ""
@@ -1104,10 +1726,22 @@ def get_trends():
         cleaned = [re.sub(r'\(.*?\)|^(APPELLANT:|RESPONDENT:|JUDGE:)', '', e).strip() for e in entities]
         all_entities.extend([name for name in cleaned if len(name) > 3])
     entity_counts = Counter(all_entities).most_common(10)
-    cursor.execute("SELECT practice_area, COUNT(*) FROM cases WHERE status='Analyzed' AND practice_area IS NOT NULL GROUP BY practice_area ORDER BY COUNT(*) DESC")
+    
+    cursor.execute(f"""
+        SELECT practice_area, COUNT(*) FROM cases {where_clause} 
+        AND practice_area IS NOT NULL 
+        GROUP BY practice_area 
+        ORDER BY COUNT(*) DESC
+    """, params)
     practice_area_trends = [{"area": row[0], "count": row[1]} for row in cursor.fetchall()]
-    cursor.execute("SELECT document_type, COUNT(*) FROM cases WHERE status='Analyzed' GROUP BY document_type ORDER BY COUNT(*) DESC")
+    
+    cursor.execute(f"""
+        SELECT document_type, COUNT(*) FROM cases {where_clause}
+        GROUP BY document_type 
+        ORDER BY COUNT(*) DESC
+    """, params)
     document_type_trends = [{"type": row[0], "count": row[1]} for row in cursor.fetchall()]
+    
     conn.close()
     return jsonify({
         "top_entities": entity_counts,

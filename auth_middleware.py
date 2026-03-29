@@ -1,4 +1,4 @@
-# auth_middleware.py - Enhanced with better quota checking
+# auth_middleware.py - Enhanced with client verification
 import os
 import jwt
 import pyodbc
@@ -19,7 +19,6 @@ def get_db_connection():
     if not SQLSERVER_CONN_STRING:
         raise ValueError("SQLSERVER_CONN_STRING not found")
     return pyodbc.connect(SQLSERVER_CONN_STRING)
-
 
 def get_user_from_token():
     auth_header = request.headers.get('Authorization')
@@ -104,6 +103,73 @@ def get_current_user_quota():
     except Exception as e:
         print(f"Error getting user quota: {e}")
         return None, None
+
+def verify_client_ownership(client_id, user_id=None):
+    """
+    Verify that a client belongs to a specific user.
+    If user_id is None, uses the current authenticated user.
+    Returns True if the client belongs to the user, False otherwise.
+    
+    Args:
+        client_id (int): The client ID to verify
+        user_id (str, optional): The user ID to check against. Defaults to current user.
+    
+    Returns:
+        bool: True if client belongs to user, False otherwise
+    """
+    if user_id is None:
+        user = get_user_from_token()
+        if not user:
+            return False
+        user_id = user['user_id']
+    
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT Id FROM Clients WHERE Id = ? AND UserId = ?", (client_id, user_id))
+        result = cursor.fetchone()
+        conn.close()
+        return result is not None
+    except Exception as e:
+        print(f"Error verifying client ownership: {e}")
+        return False
+
+def require_client_access(f):
+    """
+    Decorator to require client access verification.
+    Expects 'client_id' in request args, form, or json.
+    """
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        user = get_user_from_token()
+        
+        if not user:
+            return jsonify({"error": "Authentication required"}), 401
+        
+        # Check if user is admin/manager (bypass client check)
+        user_roles = user.get('roles', [])
+        is_admin = 'Admin' in user_roles or 'Manager' in user_roles
+        
+        if not is_admin:
+            # Get client_id from various sources
+            client_id = (
+                request.args.get('clientId') or 
+                request.form.get('clientId') or 
+                (request.get_json() or {}).get('clientId')
+            )
+            
+            if client_id:
+                try:
+                    client_id = int(client_id)
+                    if not verify_client_ownership(client_id, user['user_id']):
+                        return jsonify({"error": "Access denied to this client"}), 403
+                except ValueError:
+                    return jsonify({"error": "Invalid client ID"}), 400
+        
+        request.current_user = user
+        return f(*args, **kwargs)
+    
+    return decorated_function
 
 def require_auth(f):
     """Decorator to require authentication"""
@@ -210,3 +276,64 @@ def log_user_action(action_type, details=None):
         conn.close()
     except Exception as e:
         print(f"Error logging user action: {e}")
+
+def get_user_clients(user_id=None):
+    """
+    Get all clients belonging to a user.
+    If user_id is None, uses the current authenticated user.
+    
+    Args:
+        user_id (str, optional): The user ID. Defaults to current user.
+    
+    Returns:
+        list: List of client dictionaries
+    """
+    if user_id is None:
+        user = get_user_from_token()
+        if not user:
+            return []
+        user_id = user['user_id']
+    
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT Id, Name, Email, Phone, Address, CreatedAt, UpdatedAt
+            FROM Clients
+            WHERE UserId = ?
+            ORDER BY Name
+        """, (user_id,))
+        
+        rows = cursor.fetchall()
+        conn.close()
+        
+        clients = []
+        for row in rows:
+            clients.append({
+                'id': row[0],
+                'name': row[1],
+                'email': row[2],
+                'phone': row[3],
+                'address': row[4],
+                'createdAt': row[5].isoformat() if row[5] else None,
+                'updatedAt': row[6].isoformat() if row[6] else None
+            })
+        
+        return clients
+    except Exception as e:
+        print(f"Error getting user clients: {e}")
+        return []
+
+def is_admin_or_manager():
+    """
+    Check if the current user has Admin or Manager role.
+    
+    Returns:
+        bool: True if user is Admin or Manager, False otherwise
+    """
+    user = get_user_from_token()
+    if not user:
+        return False
+    
+    user_roles = user.get('roles', [])
+    return 'Admin' in user_roles or 'Manager' in user_roles
