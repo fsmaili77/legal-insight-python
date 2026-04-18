@@ -775,9 +775,18 @@ def get_documents():
         
         # 🔥 FIX: If no clientId provided for non-admin, return empty list
         # This enforces client selection before viewing documents
-        if not client_id:
-            conn.close()
-            return jsonify([])
+        if client_id:
+            try:
+                client_id_int = int(client_id)
+                # Verify client belongs to user (unless admin)
+                if not verify_client_ownership(client_id_int, user_id):
+                    conn.close()
+                    return jsonify({"error": "Access denied to this client"}), 403
+                where_conditions.append("client_id = ?")
+                params.append(client_id_int)
+            except ValueError:
+                conn.close()
+                return jsonify({"error": "Invalid client ID"}), 400
     
     # 🔥 FIX: Client filter - ALWAYS apply when clientId is provided
     if client_id:
