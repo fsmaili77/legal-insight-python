@@ -4,12 +4,30 @@ import json
 import logging
 import requests
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from flask import Blueprint, request, jsonify
 import pyodbc
 from sentence_transformers import SentenceTransformer
 import uuid
 import re
+
+def make_json_serializable(obj):
+    """
+    Recursively convert objects to JSON-serializable format.
+    Handles datetime, sets, tuples, and other non-standard types.
+    """
+    if isinstance(obj, dict):
+        return {k: make_json_serializable(v) for k, v in obj.items()}
+    elif isinstance(obj, (list, tuple, set)):
+        return [make_json_serializable(v) for v in obj]
+    elif isinstance(obj, (datetime, date)):
+        return obj.isoformat()
+    elif isinstance(obj, (bytes, bytearray)):
+        return obj.decode('utf-8', errors='ignore')
+    elif hasattr(obj, '__dict__'):
+        # Handle custom objects by converting to dict
+        return make_json_serializable(obj.__dict__)
+    return obj
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -432,53 +450,96 @@ def analyze_case():
         analysis_type = data.get('analysis_type', 'case-strategy')
         case_context = data.get('case_context', {})
         user_id = data.get('user_id', 'system')
+        
+        # ✅ Add type validation
+        if not isinstance(document_ids, list):
+            return jsonify({'error': 'document_ids must be an array'}), 400
+        if not isinstance(analysis_type, str):
+            return jsonify({'error': f'analysis_type must be a string, got {type(analysis_type).__name__}'}), 400
+        if not isinstance(case_context, dict):
+            return jsonify({'error': f'case_context must be an object, got {type(case_context).__name__}'}), 400
+                
         if not document_ids:
             return jsonify({'error': 'document_ids are required'}), 400
-
+        
         analysis_id = str(uuid.uuid4())
         conn = pyodbc.connect(os.getenv("SQLSERVER_CONN_STRING"))
         cursor = conn.cursor()
+        
+        # ✅ FIX: Ensure all dict/list params are properly JSON-serialized
+        try:
+            document_ids_json = json.dumps(make_json_serializable(document_ids))
+            case_context_json = json.dumps(make_json_serializable(case_context))
+            data_json = json.dumps(make_json_serializable(data))
+        except (TypeError, ValueError) as e:
+            logger.error(f"JSON serialization error: {e}")
+            # Fallback to string representation if JSON fails
+            document_ids_json = str(document_ids)
+            case_context_json = str(case_context)
+            data_json = str(data)
+        
         cursor.execute("""
-            INSERT INTO case_analyses (analysis_id, user_id, analysis_type, document_ids, case_context, analysis_parameters, status)
+            INSERT INTO case_analyses (
+                analysis_id, user_id, analysis_type, document_ids, 
+                case_context, analysis_parameters, status
+            )
             VALUES (?, ?, ?, ?, ?, ?, 'processing')
-        """, (analysis_id, user_id, analysis_type, json.dumps(document_ids), json.dumps(case_context), json.dumps(data)))
+        """, (
+            analysis_id, 
+            user_id, 
+            analysis_type,  # This is a string - safe
+            document_ids_json,   # ✅ Now guaranteed string
+            case_context_json,   # ✅ Now guaranteed string
+            data_json            # ✅ Now guaranteed string
+        ))
         conn.commit()
-
+        
+        # Fetch document texts for analysis
         document_texts = []
         for doc_id in document_ids:
             cursor.execute("SELECT extracted_text, filename FROM cases WHERE id = ?", (doc_id,))
             row = cursor.fetchone()
             if row and row[0]:
                 document_texts.append(row[0])
-
+        
         if not document_texts:
-            cursor.execute("UPDATE case_analyses SET status = 'failed', error_message = 'No document texts found' WHERE analysis_id = ?", (analysis_id,))
+            cursor.execute(
+                "UPDATE case_analyses SET status = 'failed', error_message = ? WHERE analysis_id = ?", 
+                ('No document texts found', analysis_id)
+            )
             conn.commit()
+            conn.close()
             return jsonify({'error': 'No valid document texts found'}), 400
-
+        
+        # Perform analysis
         legal_issues = extract_legal_issues(document_texts)
         jurisdiction = case_context.get('jurisdiction', 'general')
         practice_area = case_context.get('caseType', 'litigation')
         precedents = find_relevant_precedents(legal_issues, jurisdiction)
         risks = assess_case_risks(legal_issues, case_context, practice_area)
         recommendations = generate_strategic_recommendations(analysis_type, legal_issues, precedents, risks, case_context)
-
+        
+        # ✅ FIX: Ensure result content is JSON-serialized before DB insert
         results = [
-            {'result_type': 'legal_issues', 'content': json.dumps(legal_issues), 'confidence_score': 0.8},
-            {'result_type': 'precedents', 'content': json.dumps(precedents), 'confidence_score': 0.9},
-            {'result_type': 'risks', 'content': json.dumps(risks), 'confidence_score': 0.85},
-            {'result_type': 'recommendations', 'content': recommendations, 'confidence_score': 0.9}
+            {'result_type': 'legal_issues', 'content': json.dumps(make_json_serializable(legal_issues)), 'confidence_score': 0.8},
+            {'result_type': 'precedents', 'content': json.dumps(make_json_serializable(precedents)), 'confidence_score': 0.9},
+            {'result_type': 'risks', 'content': json.dumps(make_json_serializable(risks)), 'confidence_score': 0.85},
+            {'result_type': 'recommendations', 'content': str(recommendations), 'confidence_score': 0.9}  # recommendations is already a string
         ]
+        
         for r in results:
             cursor.execute("""
                 INSERT INTO case_analysis_results (analysis_id, result_type, content, confidence_score)
                 VALUES (?, ?, ?, ?)
             """, (analysis_id, r['result_type'], r['content'], r['confidence_score']))
-
-        cursor.execute("UPDATE case_analyses SET status = 'completed', completed_at = GETDATE() WHERE analysis_id = ?", (analysis_id,))
+        
+        cursor.execute(
+            "UPDATE case_analyses SET status = 'completed', completed_at = GETDATE() WHERE analysis_id = ?", 
+            (analysis_id,)
+        )
         conn.commit()
         conn.close()
-
+        
         return jsonify({
             'analysis_id': analysis_id,
             'analysis_type': analysis_type,
@@ -491,8 +552,16 @@ def analyze_case():
             'documents_analyzed': len(document_texts),
             'completed_at': datetime.now().isoformat()
         }), 200
+        
     except Exception as e:
-        logger.error(f"Error in case analysis: {e}")
+        logger.error(f"Error in case analysis: {e}", exc_info=True)
+        # Attempt to rollback if connection is still open
+        try:
+            if 'conn' in locals() and conn:
+                conn.rollback()
+                conn.close()
+        except:
+            pass
         return jsonify({'error': f'Case analysis failed: {str(e)}'}), 500
 
 @case_analysis_service.route('/research-precedents', methods=['POST'])
@@ -603,48 +672,81 @@ def get_case_analysis(analysis_id):
     try:
         conn = pyodbc.connect(os.getenv("SQLSERVER_CONN_STRING"))
         cursor = conn.cursor()
+        
         cursor.execute("""
-            SELECT analysis_id, case_title, analysis_type, document_ids, case_context, status, created_at, completed_at, error_message
+            SELECT analysis_id, case_title, analysis_type, document_ids, case_context, 
+                   status, created_at, completed_at, error_message
             FROM case_analyses WHERE analysis_id = ?
         """, (analysis_id,))
         analysis_row = cursor.fetchone()
+        
         if not analysis_row:
+            conn.close()
             return jsonify({'error': f'Analysis {analysis_id} not found'}), 404
+        
         cursor.execute("""
             SELECT result_type, content, confidence_score, metadata
             FROM case_analysis_results WHERE analysis_id = ?
             ORDER BY created_at
         """, (analysis_id,))
+        
         results = {}
         for row in cursor.fetchall():
             result_type = row[0]
             content = row[1]
-            if result_type in ['legal_issues', 'precedents', 'risks']:
-                try:
+            # ✅ FIX: Safe JSON parsing with fallback
+            try:
+                if result_type in ['legal_issues', 'precedents', 'risks'] and content:
                     content = json.loads(content)
-                except:
+            except (json.JSONDecodeError, TypeError):
+                logger.warning(f"Failed to parse JSON for {result_type}: {content[:100]}...")
+                # Keep as string if parsing fails
+                pass
+            
+            # Parse metadata if present
+            metadata = None
+            if row[3]:
+                try:
+                    metadata = json.loads(row[3])
+                except (json.JSONDecodeError, TypeError):
                     pass
+            
             results[result_type] = {
                 'content': content,
                 'confidence_score': row[2],
-                'metadata': json.loads(row[3]) if row[3] else None
+                'metadata': metadata
             }
+        
         conn.close()
+        
+        # Parse document_ids and case_context with error handling
+        try:
+            doc_ids = json.loads(analysis_row[3]) if analysis_row[3] else []
+        except (json.JSONDecodeError, TypeError):
+            doc_ids = []
+        
+        try:
+            ctx = json.loads(analysis_row[4]) if analysis_row[4] else {}
+        except (json.JSONDecodeError, TypeError):
+            ctx = {}
+        
         analysis = {
             'analysis_id': analysis_row[0],
             'case_title': analysis_row[1],
             'analysis_type': analysis_row[2],
-            'document_ids': json.loads(analysis_row[3]) if analysis_row[3] else [],
-            'case_context': json.loads(analysis_row[4]) if analysis_row[4] else {},
+            'document_ids': doc_ids,
+            'case_context': ctx,
             'status': analysis_row[5],
             'created_at': analysis_row[6].isoformat() if analysis_row[6] else None,
             'completed_at': analysis_row[7].isoformat() if analysis_row[7] else None,
             'error_message': analysis_row[8],
             'results': results
         }
+        
         return jsonify(analysis), 200
+        
     except Exception as e:
-        logger.error(f"Error fetching analysis {analysis_id}: {e}")
+        logger.error(f"Error fetching analysis {analysis_id}: {e}", exc_info=True)
         return jsonify({'error': f'Failed to fetch analysis: {str(e)}'}), 500
 
 @case_analysis_service.route('/strategy-recommendations', methods=['POST'])

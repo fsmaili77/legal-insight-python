@@ -35,9 +35,6 @@ load_dotenv()
 
 # --- Initialization ---
 app = Flask(__name__)
-app.register_blueprint(compare_service, url_prefix='/service-plus')
-app.register_blueprint(document_generation_service, url_prefix='/service-plus')
-app.register_blueprint(case_analysis_service, url_prefix='/service-plus')
 
 CORS(app, resources={
     r"/*": {
@@ -47,6 +44,46 @@ CORS(app, resources={
         "supports_credentials": True
     }
 })
+
+@app.after_request
+def add_cors_headers(response):
+    origin = request.headers.get('Origin', '')
+    allowed_origins = [
+        "http://localhost:3001",
+        "http://localhost:4028", 
+        "http://localhost:5173",
+        "http://localhost:8080"
+    ]
+    if origin in allowed_origins:
+        response.headers['Access-Control-Allow-Origin'] = origin
+        response.headers['Access-Control-Allow-Credentials'] = 'true'
+        response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, PATCH, DELETE, OPTIONS'
+        response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, X-Requested-With'
+    return response
+
+@app.before_request
+def handle_preflight():
+    if request.method == "OPTIONS":
+        response = app.make_default_options_response()
+        headers = response.headers
+        headers["Access-Control-Allow-Origin"] = request.headers.get("Origin", "*")
+        headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
+        headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Requested-With"
+        headers["Access-Control-Allow-Credentials"] = "true"
+        return response
+
+app.register_blueprint(compare_service, url_prefix='/service-plus')
+app.register_blueprint(document_generation_service, url_prefix='/service-plus')
+app.register_blueprint(case_analysis_service, url_prefix='/service-plus')
+
+""" CORS(app, resources={
+    r"/*": {
+        "origins": ["http://localhost:3001", "http://localhost:4028", "http://localhost:5173", "http://localhost:8080"],
+        "methods": ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+        "allow_headers": ["Content-Type", "Authorization", "X-Requested-With"],
+        "supports_credentials": True
+    }
+}) """
 
 UPLOAD_FOLDER = 'uploads'
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
@@ -172,11 +209,16 @@ def init_db():
 
 # --- Helper: Verify client ownership ---
 def verify_client_ownership(client_id, user_id):
-    """Verify that a client belongs to the specified user"""
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute("SELECT Id FROM Clients WHERE Id = ? AND UserId = ?", (client_id, user_id))
+        cols = get_clients_columns()
+        id_col = cols.get('id', 'Id')
+        userid_col = cols.get('userid', 'UserId')
+        cursor.execute(
+            f"SELECT {id_col} FROM Clients WHERE {id_col} = ? AND {userid_col} = ?",
+            (client_id, user_id)
+        )
         result = cursor.fetchone()
         conn.close()
         return result is not None
@@ -421,6 +463,15 @@ Return ONLY in the specified JSON format."""
         return None
 
 # --- Routes ---
+def get_clients_columns():
+    """Returns a dict mapping lowercase logical name → actual DB column name"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = 'Clients'")
+    cols = {c[0].lower(): c[0] for c in cursor.fetchall()}
+    conn.close()
+    return cols
+
 @app.route('/analyze', methods=['POST'])
 @require_auth
 def analyze_document_route():
@@ -920,38 +971,76 @@ def get_clients():
     conn = get_db_connection()
     cursor = conn.cursor()
     
-    if is_admin:
-        # Admins see all clients
-        cursor.execute("""
-            SELECT Id, Name, Email, Phone, Address, UserId, CreatedAt, UpdatedAt
-            FROM Clients
-            ORDER BY Name
-        """)
-    else:
-        # Regular users only see their own clients
-        cursor.execute("""
-            SELECT Id, Name, Email, Phone, Address, UserId, CreatedAt, UpdatedAt
-            FROM Clients
-            WHERE UserId = ?
-            ORDER BY Name
-        """, (user_id,))
+    # Discover actual column names in the Clients table
+    cursor.execute("""
+        SELECT COLUMN_NAME 
+        FROM INFORMATION_SCHEMA.COLUMNS 
+        WHERE TABLE_NAME = 'Clients'
+        ORDER BY ORDINAL_POSITION
+    """)
+    actual_columns = [row[0] for row in cursor.fetchall()]
+    logger.info(f"Clients table actual columns: {actual_columns}")
     
-    rows = cursor.fetchall()
-    clients = []
-    for row in rows:
-        clients.append({
-            'id': row[0],
-            'name': row[1],
-            'email': row[2],
-            'phone': row[3],
-            'address': row[4],
-            'userId': row[5],
-            'createdAt': row[6].isoformat() if row[6] else None,
-            'updatedAt': row[7].isoformat() if row[7] else None
-        })
+    # Build a case-insensitive column lookup
+    col_map = {c.lower(): c for c in actual_columns}
     
-    conn.close()
-    return jsonify(clients)
+    # Map expected logical names to actual DB column names
+    # ✅ FIX: Check for 'phonenumber' first (your actual column), then 'phone' as fallback
+    id_col      = col_map.get('id', 'Id')
+    name_col    = col_map.get('name', col_map.get('firstname', 'Name'))
+    email_col   = col_map.get('email', 'Email')
+    phone_col   = col_map.get('phonenumber', col_map.get('phone', 'Phone'))  # ✅ FIXED
+    address_col = col_map.get('address', 'Address')
+    userid_col  = col_map.get('userid', 'UserId')
+    created_col = col_map.get('createdat', 'CreatedAt')
+    updated_col = col_map.get('updatedat', 'UpdatedAt')
+    
+    # Check if table has separate firstName/lastName columns (C# EF Core style)
+    has_firstname = 'firstname' in col_map
+    has_lastname  = 'lastname' in col_map
+    
+    try:
+        if is_admin:
+            cursor.execute(f"""
+                SELECT {id_col}, {name_col if not has_firstname else col_map['firstname']},
+                       {email_col}, {phone_col}, {address_col}, {userid_col},
+                       {created_col}, {updated_col}
+                       {', ' + col_map['lastname'] if has_lastname else ''}
+                FROM Clients ORDER BY {name_col if not has_firstname else col_map['firstname']}
+            """)
+        else:
+            cursor.execute(f"""
+                SELECT {id_col}, {name_col if not has_firstname else col_map['firstname']},
+                       {email_col}, {phone_col}, {address_col}, {userid_col},
+                       {created_col}, {updated_col}
+                       {', ' + col_map['lastname'] if has_lastname else ''}
+                FROM Clients WHERE {userid_col} = ?
+                ORDER BY {name_col if not has_firstname else col_map['firstname']}
+            """, (user_id,))
+        
+        rows = cursor.fetchall()
+        clients = []
+        for row in rows:
+            if has_firstname and has_lastname:
+                display_name = f"{row[1] or ''} {row[8] or ''}".strip()
+            else:
+                display_name = row[1] or ''
+            clients.append({
+                'id': row[0],
+                'name': display_name,
+                'email': row[2],
+                'phone': row[3],  # ✅ Returns value from dynamic phone_col
+                'address': row[4],
+                'userId': row[5],
+                'createdAt': row[6].isoformat() if row[6] else None,
+                'updatedAt': row[7].isoformat() if row[7] else None,
+            })
+        conn.close()
+        return jsonify(clients)
+    except Exception as e:
+        conn.close()
+        logger.error(f"get_clients error: {e}")
+        return jsonify({"error": str(e), "columns_found": actual_columns}), 500
 
 @app.route('/clients', methods=['POST'])
 @require_auth
@@ -966,41 +1055,34 @@ def create_client():
     
     name = data.get('name')
     email = data.get('email', '')
-    phone = data.get('phone', '')
+    phone = data.get('phone', '')  # Frontend sends 'phone'
     address = data.get('address', '')
     
     conn = get_db_connection()
     cursor = conn.cursor()
     
-    try:
-        cursor.execute("""
-            INSERT INTO Clients (Name, Email, Phone, Address, UserId, CreatedAt, UpdatedAt)
-            VALUES (?, ?, ?, ?, ?, GETDATE(), GETDATE())
-        """, (name, email, phone, address, user_id))
-        
-        conn.commit()
-        
-        cursor.execute("SELECT SCOPE_IDENTITY()")
-        client_id = cursor.fetchone()[0]
-        
-        conn.close()
-        
-        log_user_action('client_created', {
-            'client_id': client_id,
-            'name': name
-        })
-        
-        return jsonify({
-            "status": "success",
-            "id": client_id,
-            "name": name,
-            "userId": user_id
-        }), 201
-        
-    except Exception as e:
-        conn.close()
-        logger.error(f"Error creating client: {e}")
-        return jsonify({"error": "Failed to create client"}), 500
+    # ✅ FIX: Use actual DB column name 'PhoneNumber' in INSERT
+    cursor.execute("""
+        INSERT INTO Clients (Name, Email, PhoneNumber, Address, UserId, CreatedAt, UpdatedAt)
+        VALUES (?, ?, ?, ?, ?, GETDATE(), GETDATE())
+    """, (name, email, phone, address, user_id))  # ✅ 'phone' value mapped to 'PhoneNumber' column
+    
+    conn.commit()
+    cursor.execute("SELECT SCOPE_IDENTITY()")
+    client_id = cursor.fetchone()[0]
+    conn.close()
+    
+    log_user_action('client_created', {
+        'client_id': client_id,
+        'name': name
+    })
+    
+    return jsonify({
+        "status": "success",
+        "id": client_id,
+        "name": name,
+        "userId": user_id
+    }), 201
 
 @app.route('/clients/<int:client_id>', methods=['GET'])
 @require_auth
@@ -1014,15 +1096,43 @@ def get_client_by_id(client_id):
     conn = get_db_connection()
     cursor = conn.cursor()
     
+    # ✅ FIX: Use dynamic column mapping instead of hardcoded names
+    cursor.execute("""
+        SELECT COLUMN_NAME 
+        FROM INFORMATION_SCHEMA.COLUMNS 
+        WHERE TABLE_NAME = 'Clients'
+        ORDER BY ORDINAL_POSITION
+    """)
+    actual_columns = [row[0] for row in cursor.fetchall()]
+    col_map = {c.lower(): c for c in actual_columns}
+    
+    id_col      = col_map.get('id', 'Id')
+    name_col    = col_map.get('name', col_map.get('firstname', 'Name'))
+    email_col   = col_map.get('email', 'Email')
+    phone_col   = col_map.get('phonenumber', col_map.get('phone', 'Phone'))  # ✅ FIXED
+    address_col = col_map.get('address', 'Address')
+    userid_col  = col_map.get('userid', 'UserId')
+    created_col = col_map.get('createdat', 'CreatedAt')
+    updated_col = col_map.get('updatedat', 'UpdatedAt')
+    
+    has_firstname = 'firstname' in col_map
+    has_lastname  = 'lastname' in col_map
+    
     if is_admin:
-        cursor.execute("""
-            SELECT Id, Name, Email, Phone, Address, UserId, CreatedAt, UpdatedAt
-            FROM Clients WHERE Id = ?
+        cursor.execute(f"""
+            SELECT {id_col}, {name_col if not has_firstname else col_map['firstname']},
+                   {email_col}, {phone_col}, {address_col}, {userid_col},
+                   {created_col}, {updated_col}
+                   {', ' + col_map['lastname'] if has_lastname else ''}
+            FROM Clients WHERE {id_col} = ?
         """, (client_id,))
     else:
-        cursor.execute("""
-            SELECT Id, Name, Email, Phone, Address, UserId, CreatedAt, UpdatedAt
-            FROM Clients WHERE Id = ? AND UserId = ?
+        cursor.execute(f"""
+            SELECT {id_col}, {name_col if not has_firstname else col_map['firstname']},
+                   {email_col}, {phone_col}, {address_col}, {userid_col},
+                   {created_col}, {updated_col}
+                   {', ' + col_map['lastname'] if has_lastname else ''}
+            FROM Clients WHERE {id_col} = ? AND {userid_col} = ?
         """, (client_id, user_id))
     
     row = cursor.fetchone()
@@ -1031,11 +1141,17 @@ def get_client_by_id(client_id):
     if not row:
         return jsonify({"error": "Client not found or access denied"}), 404
     
+    # Build response using dynamic column positions
+    if has_firstname and has_lastname:
+        display_name = f"{row[1] or ''} {row[8] or ''}".strip()
+    else:
+        display_name = row[1] or ''
+    
     return jsonify({
         'id': row[0],
-        'name': row[1],
+        'name': display_name,
         'email': row[2],
-        'phone': row[3],
+        'phone': row[3],  # ✅ Returns value from dynamic phone_col
         'address': row[4],
         'userId': row[5],
         'createdAt': row[6].isoformat() if row[6] else None,
@@ -1059,20 +1175,36 @@ def update_client(client_id):
     conn = get_db_connection()
     cursor = conn.cursor()
     
+    # ✅ FIX: Use dynamic column mapping for UPDATE statement
+    cursor.execute("""
+        SELECT COLUMN_NAME 
+        FROM INFORMATION_SCHEMA.COLUMNS 
+        WHERE TABLE_NAME = 'Clients'
+        ORDER BY ORDINAL_POSITION
+    """)
+    actual_columns = [row[0] for row in cursor.fetchall()]
+    col_map = {c.lower(): c for c in actual_columns}
+    
+    id_col      = col_map.get('id', 'Id')
+    name_col    = col_map.get('name', col_map.get('firstname', 'Name'))
+    email_col   = col_map.get('email', 'Email')
+    phone_col   = col_map.get('phonenumber', col_map.get('phone', 'Phone'))  # ✅ FIXED
+    address_col = col_map.get('address', 'Address')
+    
     update_fields = []
     params = []
     
     if 'name' in data:
-        update_fields.append("Name = ?")
+        update_fields.append(f"{name_col} = ?")
         params.append(data['name'])
     if 'email' in data:
-        update_fields.append("Email = ?")
+        update_fields.append(f"{email_col} = ?")
         params.append(data['email'])
     if 'phone' in data:
-        update_fields.append("Phone = ?")
+        update_fields.append(f"{phone_col} = ?")  # ✅ Uses dynamic phone_col
         params.append(data['phone'])
     if 'address' in data:
-        update_fields.append("Address = ?")
+        update_fields.append(f"{address_col} = ?")
         params.append(data['address'])
     
     if not update_fields:
@@ -1082,7 +1214,7 @@ def update_client(client_id):
     update_fields.append("UpdatedAt = GETDATE()")
     params.append(client_id)
     
-    query = f"UPDATE Clients SET {', '.join(update_fields)} WHERE Id = ?"
+    query = f"UPDATE Clients SET {', '.join(update_fields)} WHERE {id_col} = ?"
     cursor.execute(query, params)
     conn.commit()
     conn.close()
